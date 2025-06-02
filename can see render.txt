@@ -1,0 +1,208 @@
+import open3d as o3d
+import numpy as np
+import os
+import time
+
+# --- CÀI ĐẶT THAM SỐ ---
+POINT_CLOUD_FILE_PATH = "1M_cloud.ply" # <<< THAY ĐỔI ĐƯỜNG DẪN NÀY
+# Ví dụ, nếu bạn tải file lên Colab có tên "model.ply", đường dẫn sẽ là "/content/model.ply"
+
+# Tham số cho ước lượng pháp tuyến (quan trọng cho shading)
+NORMAL_ESTIMATION_RADIUS_FACTOR = 1.5 # Nhân với khoảng cách trung bình giữa các điểm lân cận
+NORMAL_ESTIMATION_MAX_NN = 30       # Số lân cận tối đa
+ORIENT_NORMALS_K = 15               # Số lân cận cho việc định hướng pháp tuyến
+
+# Tham số cho shading thủ công (nếu dùng)
+MANUAL_SHADING_LIGHT_DIRECTION = [0.5, 0.5, 1.0] # Hướng nguồn sáng ảo
+AMBIENT_STRENGTH = 0.25
+DIFFUSE_STRENGTH = 0.75
+
+# Tham số cho visualizer
+INITIAL_POINT_SIZE = 1.5 # Kích thước điểm ban đầu (có thể điều chỉnh trong GUI)
+WINDOW_WIDTH = 1280
+WINDOW_HEIGHT = 720
+BACKGROUND_COLOR = [0.1, 0.1, 0.1] # Màu nền xám tối
+
+# --- HÀM TIỆN ÍCH ---
+
+def load_point_cloud(filepath):
+    """Tải point cloud từ file và kiểm tra cơ bản."""
+    if not os.path.exists(filepath):
+        print(f"Lỗi: File không tồn tại tại '{filepath}'")
+        return None
+    try:
+        print(f"Đang tải point cloud từ: {filepath}...")
+        pcd = o3d.io.read_point_cloud(filepath)
+        if not pcd.has_points():
+            print("Lỗi: Point cloud rỗng sau khi tải.")
+            return None
+        print(f"Tải thành công: {len(pcd.points)} điểm.")
+        return pcd
+    except Exception as e:
+        print(f"Lỗi khi tải point cloud: {e}")
+        return None
+
+def preprocess_point_cloud(pcd, radius_factor, max_nn, orient_k):
+    """Ước lượng pháp tuyến nếu chưa có."""
+    if not pcd.has_normals():
+        print("Point cloud chưa có pháp tuyến. Đang ước lượng...")
+        start_time = time.time()
+        # Tính toán radius dựa trên mật độ điểm
+        if len(pcd.points) > max_nn:
+            try:
+                # o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Warning)
+                distances = pcd.compute_nearest_neighbor_distance()
+                avg_dist = np.mean(distances)
+                radius = avg_dist * radius_factor
+                # o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Info)
+                print(f"  Khoảng cách lân cận TB: {avg_dist:.4f}, Radius pháp tuyến: {radius:.4f}")
+            except Exception as e_dist:
+                print(f"  Lỗi tính avg_dist: {e_dist}. Sử dụng radius mặc định nhỏ (0.01).")
+                radius = 0.01 # Fallback
+        else:
+            print(f"  PCD quá ít điểm ({len(pcd.points)}). Sử dụng radius mặc định nhỏ (0.01).")
+            radius = 0.01 # Fallback
+
+        pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=max_nn))
+        pcd.orient_normals_consistent_tangent_plane(orient_k)
+        end_time = time.time()
+        if not pcd.has_normals():
+            print("  Ước lượng pháp tuyến thất bại.")
+        else:
+            print(f"  Đã ước lượng pháp tuyến ({end_time - start_time:.2f}s).")
+    else:
+        print("Point cloud đã có pháp tuyến.")
+
+    if not pcd.has_colors():
+        print("Point cloud chưa có màu. Gán màu xám mặc định.")
+        pcd.paint_uniform_color([0.6, 0.6, 0.6]) # Màu xám trung tính
+    return pcd
+
+def apply_manual_normal_shading(pcd, light_direction, ambient_strength, diffuse_strength):
+    """Tô bóng point cloud dựa trên pháp tuyến và nguồn sáng ảo."""
+    if not pcd.has_normals():
+        print("Cảnh báo: Không thể áp dụng manual shading vì point cloud không có pháp tuyến.")
+        return pcd
+
+    print("Đang áp dụng manual normal shading...")
+    light_dir_norm = np.array(light_direction) / np.linalg.norm(light_direction)
+    normals = np.asarray(pcd.normals)
+    
+    # Đảm bảo normals đã được chuẩn hóa (estimate_normals thường làm điều này)
+    # Nếu không chắc, có thể thêm: normals = normals / np.linalg.norm(normals, axis=1, keepdims=True)
+
+    intensities = np.dot(normals, light_dir_norm)
+    diffuse_contrib = np.maximum(0, intensities) * diffuse_strength # Chỉ mặt hướng về nguồn sáng mới nhận diffuse
+    shaded_intensities = ambient_strength + diffuse_contrib
+    shaded_intensities = np.clip(shaded_intensities, 0, 1)
+
+    original_colors = np.asarray(pcd.colors)
+    new_colors = np.zeros_like(original_colors)
+    for i in range(3): # R, G, B
+        new_colors[:, i] = original_colors[:, i] * shaded_intensities
+    
+    pcd_shaded = o3d.geometry.PointCloud()
+    pcd_shaded.points = pcd.points
+    pcd_shaded.colors = o3d.utility.Vector3dVector(np.clip(new_colors, 0, 1))
+    pcd_shaded.normals = pcd.normals # Giữ lại pháp tuyến
+    print("Đã áp dụng manual normal shading.")
+    return pcd_shaded
+
+
+def render_point_cloud_with_advanced_shading(pcd_to_render):
+    """Hiển thị point cloud với các tùy chọn shading nâng cao của Open3D Visualizer."""
+    print("\n--- KHỞI ĐỘNG OPEN3D VISUALIZER ---")
+    print("Trong cửa sổ hiển thị, hãy thử các thao tác sau:")
+    print("  - Kéo chuột trái: Xoay camera.")
+    print("  - Lăn chuột: Zoom.")
+    print("  - Kéo chuột phải (hoặc Shift + Kéo chuột trái): Di chuyển camera (Pan).")
+    print("  - Phím 'L': Chuyển đổi giữa các chế độ chiếu sáng. **TÌM CHẾ ĐỘ EDL (EYE-DOME LIGHTING)**.")
+    print("  - Phím 'S': Chuyển đổi giữa các kiểu tô bóng (Flat, Gouraud, Phong - có thể không rõ rệt với point cloud).")
+    print("  - Phím 'N': Bật/tắt hiển thị pháp tuyến (nếu có).")
+    print("  - Phím 'P' hoặc dấu '+': Tăng kích thước điểm.")
+    print("  - Phím 'M' hoặc dấu '-': Giảm kích thước điểm.")
+    print("  - Phím 'W': Chuyển sang chế độ wireframe (cho mesh, không áp dụng cho point cloud).")
+    print("  - Menu 'Render option': Tinh chỉnh thêm (ví dụ: bật/tắt 'Light Follows Camera').")
+    print("  - Phím 'Q' hoặc đóng cửa sổ: Thoát.")
+
+    # Tạo bản sao để không ảnh hưởng đến pcd gốc nếu có xử lý thêm trong visualizer
+    vis_pcd = o3d.geometry.PointCloud(pcd_to_render)
+
+    o3d.visualization.draw_geometries_with_editing(
+        [vis_pcd],
+        window_name="Advanced Point Cloud Rendering (Find EDL with 'L' key)",
+        width=WINDOW_WIDTH,
+        height=WINDOW_HEIGHT,
+        point_show_normal=False # Mặc định tắt hiển thị pháp tuyến dạng vector
+    )
+
+    # draw_geometries_with_editing là non-blocking nếu trong script, dùng draw_geometries cho blocking
+    # Tuy nhiên, để người dùng tương tác, draw_geometries_with_editing là phù hợp
+    # Nếu bạn muốn phiên bản blocking đơn giản hơn:
+    # o3d.visualization.draw_geometries(
+    #     [vis_pcd],
+    #     window_name="Advanced Point Cloud Rendering (Find EDL with 'L' key)",
+    #     width=WINDOW_WIDTH,
+    #     height=WINDOW_HEIGHT,
+    #     point_show_normal=False
+    # )
+
+
+# --- CHƯƠNG TRÌNH CHÍNH ---
+if __name__ == "__main__":
+    print("--- Point Cloud Advanced Rendering Script ---")
+
+    # 1. Tải Point Cloud
+    pcd = load_point_cloud(POINT_CLOUD_FILE_PATH)
+    if pcd is None:
+        print("Kết thúc chương trình do lỗi tải point cloud.")
+        exit()
+
+    # 2. Tiền xử lý (Ước lượng pháp tuyến, gán màu mặc định nếu cần)
+    pcd = preprocess_point_cloud(pcd,
+                                 radius_factor=NORMAL_ESTIMATION_RADIUS_FACTOR,
+                                 max_nn=NORMAL_ESTIMATION_MAX_NN,
+                                 orient_k=ORIENT_NORMALS_K)
+    if not pcd.has_normals():
+        print("Cảnh báo: Không thể ước lượng pháp tuyến, chất lượng shading có thể bị ảnh hưởng.")
+
+    # 3. TÙY CHỌN: Áp dụng manual normal shading
+    # Bạn có thể chọn bật/tắt dòng này để so sánh.
+    # EDL của Open3D thường tốt hơn, nhưng manual shading cho bạn control cụ thể hơn về màu sắc.
+    # Nếu bật manual shading, EDL có thể không cần thiết hoặc hiệu ứng sẽ bị chồng chéo.
+    # pcd_display = apply_manual_normal_shading(pcd,
+    #                                          light_direction=MANUAL_SHADING_LIGHT_DIRECTION,
+    #                                          ambient_strength=AMBIENT_STRENGTH,
+    #                                          diffuse_strength=DIFFUSE_STRENGTH)
+    
+    # Mặc định, chúng ta sẽ hiển thị pcd đã có pháp tuyến và màu gốc (hoặc xám)
+    # để tận dụng tối đa EDL và các shading options của visualizer.
+    pcd_display = pcd
+
+
+    # 4. Render với Visualizer nâng cao của Open3D
+    # Visualizer này cho phép người dùng tương tác và bật EDL.
+    # Thay vì `o3d.visualization.draw_geometries`, chúng ta có thể dùng một cách khác để có nhiều control hơn
+    # hoặc để đặt các option ban đầu nếu API hỗ trợ.
+    # Tuy nhiên, cách đơn giản nhất là hướng dẫn người dùng bật EDL.
+
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(window_name="Advanced Point Cloud Rendering (Find EDL with 'L' key)",
+                      width=WINDOW_WIDTH, height=WINDOW_HEIGHT)
+    vis.add_geometry(pcd_display)
+    
+    opt = vis.get_render_option()
+    opt.background_color = np.asarray(BACKGROUND_COLOR)
+    opt.point_size = INITIAL_POINT_SIZE
+    opt.light_on = True # Bật nguồn sáng cơ bản của Open3D
+    # opt.point_color_option = o3d.visualization.PointColorOption.Color # Sử dụng màu của điểm
+                                                                    # Các option khác: .XCoordinate, .YCoordinate, .ZCoordinate, .Normal
+    # opt.mesh_shade_option = o3d.visualization.MeshShadeOption.Default # Có thể ảnh hưởng đến cách điểm được tô bóng
+    
+    print("\nVisualizer đang chạy. Sử dụng các phím đã hướng dẫn (đặc biệt là 'L' cho EDL).")
+    vis.run() # Hàm này sẽ block cho đến khi cửa sổ được đóng
+    vis.destroy_window()
+
+    print("\n--- Kết thúc hiển thị ---")
+
+
